@@ -94,6 +94,7 @@ pub(super) const FLAGS: &[&dyn Flag] = &[
     &MaxColumnsPreview,
     &MaxCount,
     &MaxDepth,
+    &DirTimeout,
     &MaxFilesize,
     &Mmap,
     &Multiline,
@@ -4002,6 +4003,48 @@ fn test_max_depth() {
 }
 
 /// --max-filesize
+#[derive(Debug)]
+struct DirTimeout;
+
+impl Flag for DirTimeout {
+    fn is_switch(&self) -> bool {
+        false
+    }
+    fn name_long(&self) -> &'static str {
+        "dir-timeout"
+    }
+    fn doc_variable(&self) -> Option<&'static str> {
+        Some("SECS")
+    }
+    fn doc_category(&self) -> Category {
+        Category::Filter
+    }
+    fn doc_short(&self) -> &'static str {
+        r"Timeout per directory subtree (seconds)."
+    }
+    fn doc_long(&self) -> &'static str {
+        r#"
+This flag limits the amount of time ripgrep will spend traversing any single
+directory's subtree. When the specified number of seconds has elapsed since
+entering a directory, ripgrep will skip any remaining entries in that directory
+and bubble back up to the parent.
+.sp
+This is particularly useful when searching filesystems with very deep or
+very large directory trees that could cause ripgrep to get "lost" for extended
+periods. For example, virtual filesystems with millions of entries, or deeply
+nested node_modules directories.
+.sp
+A value of \fB0\fP is treated as no timeout. The default is no timeout.
+"#
+    }
+
+    fn update(&self, v: FlagValue, args: &mut LowArgs) -> anyhow::Result<()> {
+        let secs = convert::u64(&v.unwrap_value())?;
+        args.dir_timeout = if secs == 0 { None } else { Some(secs) };
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct MaxFilesize;
 

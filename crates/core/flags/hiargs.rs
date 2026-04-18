@@ -69,6 +69,7 @@ pub(crate) struct HiArgs {
     max_count: Option<u64>,
     max_depth: Option<usize>,
     max_filesize: Option<u64>,
+    dir_timeout: Option<u64>,
     mmap_choice: grep::searcher::MmapChoice,
     mode: Mode,
     multiline: bool,
@@ -286,6 +287,7 @@ impl HiArgs {
             max_count: low.max_count,
             max_depth: low.max_depth,
             max_filesize: low.max_filesize,
+            dir_timeout: low.dir_timeout,
             mmap_choice,
             multiline: low.multiline,
             multiline_dotall: low.multiline_dotall,
@@ -887,6 +889,7 @@ impl HiArgs {
             .max_depth(self.max_depth)
             .follow_links(self.follow)
             .max_filesize(self.max_filesize)
+            .dir_timeout(self.dir_timeout.map(std::time::Duration::from_secs))
             .threads(self.threads)
             .same_file_system(self.one_file_system)
             .skip_stdout(matches!(self.mode, Mode::Search(_)))

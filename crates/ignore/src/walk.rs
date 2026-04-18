@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
     sync::{Arc, OnceLock},
+    time::{Duration, Instant},
 };
 
 use {
@@ -492,6 +493,13 @@ pub struct WalkBuilder {
     threads: usize,
     skip: Option<Arc<Handle>>,
     filter: Option<Filter>,
+    /// The maximum amount of time to spend traversing any single directory's
+    /// subtree. When exceeded, remaining entries in that subtree are skipped
+    /// and the walk bubbles back up.
+    ///
+    /// This is useful for avoiding getting stuck in very deep or very large
+    /// directory trees.
+    dir_timeout: Option<Duration>,
     /// The directory that gitignores should be interpreted relative to.
     ///
     /// Usually this is the directory containing the gitignore file. But in
@@ -529,6 +537,7 @@ impl std::fmt::Debug for WalkBuilder {
             .field("threads", &self.threads)
             .field("skip", &self.skip)
             .field("filter", &"<...>")
+            .field("dir_timeout", &self.dir_timeout)
             .field(
                 "global_gitignores_relative_to",
                 &self.global_gitignores_relative_to,
@@ -557,6 +566,7 @@ impl WalkBuilder {
             threads: 0,
             skip: None,
             filter: None,
+            dir_timeout: None,
             global_gitignores_relative_to: OnceLock::new(),
         }
     }
@@ -614,6 +624,9 @@ impl WalkBuilder {
             max_filesize: self.max_filesize,
             skip: self.skip.clone(),
             filter: self.filter.clone(),
+            dir_timeout: self.dir_timeout,
+            dir_entered: vec![],
+            dir_skip_depth: None,
         }
     }
 
@@ -638,6 +651,7 @@ impl WalkBuilder {
             threads: self.threads,
             skip: self.skip.clone(),
             filter: self.filter.clone(),
+            dir_timeout: self.dir_timeout,
         }
     }
 
@@ -800,6 +814,23 @@ impl WalkBuilder {
     /// This is enabled by default.
     pub fn hidden(&mut self, yes: bool) -> &mut WalkBuilder {
         self.ig_builder.hidden(yes);
+        self
+    }
+
+    /// Set the per-directory timeout.
+    ///
+    /// When set, the traversal will limit how long it spends in any single
+    /// directory's subtree. If the timeout is exceeded, the remaining entries
+    /// in that directory are skipped and the walk bubbles back up to the
+    /// parent directory.
+    ///
+    /// This is useful for avoiding getting stuck in very deep or very large
+    /// directory trees (e.g., filesystems with millions of files in a single
+    /// subtree).
+    ///
+    /// The default is `None`, which imposes no per-directory time limit.
+    pub fn dir_timeout(&mut self, timeout: Option<Duration>) -> &mut WalkBuilder {
+        self.dir_timeout = timeout;
         self
     }
 
@@ -1042,6 +1073,16 @@ pub struct Walk {
     max_filesize: Option<u64>,
     skip: Option<Arc<Handle>>,
     filter: Option<Filter>,
+    /// Per-directory timeout. When set, the walk will stop processing a
+    /// directory's subtree after this duration has elapsed since entering
+    /// that directory, and bubble back up.
+    dir_timeout: Option<Duration>,
+    /// Instants recording when each directory at a given depth was entered.
+    /// Indexed by depth. Used in conjunction with `dir_timeout`.
+    dir_entered: Vec<Instant>,
+    /// If set, we're currently skipping entries at the given depth and below.
+    /// This is set when a per-directory timeout expires.
+    dir_skip_depth: Option<usize>,
 }
 
 impl Walk {
@@ -1100,6 +1141,10 @@ impl Iterator for Walk {
             let ev = match self.it.as_mut().and_then(|it| it.next()) {
                 Some(ev) => ev,
                 None => {
+                    // When moving to the next root path, clear any
+                    // skip state from a timed-out directory.
+                    self.dir_skip_depth = None;
+                    self.dir_entered.clear();
                     match self.its.next() {
                         None => return None,
                         Some((_, None)) => {
@@ -1126,9 +1171,32 @@ impl Iterator for Walk {
                     return Some(Err(Error::from_walkdir(err)));
                 }
                 Ok(WalkEvent::Exit) => {
+                    // Pop the timer for the directory we're exiting.
+                    self.dir_entered.pop();
+                    // If we were skipping at this depth, check if we've
+                    // returned to the parent that started the skip.
+                    // Since Exit events pop one at a time, eventually
+                    // dir_skip_depth will be greater than the current stack
+                    // size, at which point we clear the skip.
+                    if let Some(skip_depth) = self.dir_skip_depth {
+                        if self.dir_entered.len() < skip_depth {
+                            self.dir_skip_depth = None;
+                        }
+                    }
                     self.ig = self.ig.parent().unwrap();
                 }
                 Ok(WalkEvent::Dir(ent)) => {
+                    // Check if we're currently skipping due to a parent timeout.
+                    // skip_depth is the depth of the parent dir that timed out.
+                    // Any entry at a depth > skip_depth should be skipped.
+                    if let Some(skip_depth) = self.dir_skip_depth {
+                        if ent.depth() > skip_depth {
+                            self.it.as_mut().unwrap().it.skip_current_dir();
+                            let (igtmp, _) = self.ig.add_child(ent.path());
+                            self.ig = igtmp;
+                            continue;
+                        }
+                    }
                     let mut ent = DirEntry::new_walkdir(ent, None);
                     let should_skip = match self.skip_entry(&ent) {
                         Err(err) => return Some(Err(err)),
@@ -1141,14 +1209,48 @@ impl Iterator for Walk {
                         // We don't care if it errors though.
                         let (igtmp, _) = self.ig.add_child(ent.path());
                         self.ig = igtmp;
+                        // Don't track timeout for skipped dirs
+                        self.dir_entered.push(Instant::now());
                         continue;
+                    }
+                    // Check per-directory timeout: has the time budget for
+                    // the *parent* directory's subtree expired?
+                    if let Some(timeout) = self.dir_timeout {
+                        if self.dir_entered.last().is_some() {
+                            let entered_at = *self.dir_entered.last().unwrap();
+                            if entered_at.elapsed() > timeout {
+                                log::debug!(
+                                    "dir-timeout expired after {:?} in parent of {}, skipping remaining entries",
+                                    entered_at.elapsed(),
+                                    ent.path().display()
+                                );
+                                // Record the depth of the parent that timed out.
+                                // All entries deeper than this should be skipped.
+                                self.dir_skip_depth = Some(self.dir_entered.len());
+                                self.it.as_mut().unwrap().it.skip_current_dir();
+                                let (igtmp, _) = self.ig.add_child(ent.path());
+                                self.ig = igtmp;
+                                // Push a placeholder so Exit can pop it
+                                self.dir_entered.push(Instant::now());
+                                continue;
+                            }
+                        }
                     }
                     let (igtmp, err) = self.ig.add_child(ent.path());
                     self.ig = igtmp;
                     ent.err = err;
+                    // Record when we entered this directory.
+                    self.dir_entered.push(Instant::now());
                     return Some(Ok(ent));
                 }
                 Ok(WalkEvent::File(ent)) => {
+                    // Check if we're currently skipping due to a parent timeout.
+                    if let Some(skip_depth) = self.dir_skip_depth {
+                        if ent.depth() > skip_depth {
+                            // We're inside a timed-out subtree, skip.
+                            continue;
+                        }
+                    }
                     let ent = DirEntry::new_walkdir(ent, None);
                     let should_skip = match self.skip_entry(&ent) {
                         Err(err) => return Some(Err(err)),
@@ -1156,6 +1258,21 @@ impl Iterator for Walk {
                     };
                     if should_skip {
                         continue;
+                    }
+                    // Check per-directory timeout for files too.
+                    if let Some(timeout) = self.dir_timeout {
+                        if self.dir_entered.last().is_some() {
+                            let entered_at = *self.dir_entered.last().unwrap();
+                            if entered_at.elapsed() > timeout {
+                                log::debug!(
+                                    "dir-timeout expired after {:?} near {}, skipping remaining entries",
+                                    entered_at.elapsed(),
+                                    ent.path().display()
+                                );
+                                self.dir_skip_depth = Some(self.dir_entered.len());
+                                continue;
+                            }
+                        }
                     }
                     return Some(Ok(ent));
                 }
@@ -1322,6 +1439,7 @@ pub struct WalkParallel {
     threads: usize,
     skip: Option<Arc<Handle>>,
     filter: Option<Filter>,
+    dir_timeout: Option<Duration>,
 }
 
 impl WalkParallel {
@@ -1396,6 +1514,7 @@ impl WalkParallel {
                     dent,
                     ignore: self.ig_root.clone(),
                     root_device,
+                    deadline: None,
                 }));
             }
             // ... but there's no need to start workers if we don't need them.
@@ -1421,6 +1540,7 @@ impl WalkParallel {
                     follow_links: self.follow_links,
                     skip: self.skip.clone(),
                     filter: self.filter.clone(),
+                    dir_timeout: self.dir_timeout,
                 })
                 .map(|worker| s.spawn(|| worker.run()))
                 .collect();
@@ -1461,6 +1581,9 @@ struct Work {
     /// The root device number. When present, only files with the same device
     /// number should be considered.
     root_device: Option<u64>,
+    /// The deadline for this directory's subtree. If the deadline is reached,
+    /// remaining entries in this subtree are skipped.
+    deadline: Option<Instant>,
 }
 
 impl Work {
@@ -1620,6 +1743,8 @@ struct Worker<'s> {
     /// A predicate applied to dir entries. If true, the entry and all
     /// children will be skipped.
     filter: Option<Filter>,
+    /// Per-directory timeout duration.
+    dir_timeout: Option<Duration>,
 }
 
 impl<'s> Worker<'s> {
@@ -1636,6 +1761,19 @@ impl<'s> Worker<'s> {
     }
 
     fn run_one(&mut self, mut work: Work) -> WalkState {
+        // Check if this directory's deadline has already passed.
+        // This can happen if the work item was queued and the deadline
+        // expired before the worker picked it up.
+        if let Some(deadline) = work.deadline {
+            if Instant::now() > deadline {
+                log::debug!(
+                    "dir-timeout expired for {} before processing, skipping",
+                    work.dent.path().display()
+                );
+                return WalkState::Skip;
+            }
+        }
+
         let should_visit = self
             .min_depth
             .map(|min_depth| work.dent.depth() >= min_depth)
@@ -1681,11 +1819,16 @@ impl<'s> Worker<'s> {
         // entry before passing the error value.
         let readdir = work.read_dir();
         let depth = work.dent.depth();
+        let dir_path = work.dent.path().to_path_buf();
         if should_visit {
             let state = self.visitor.visit(Ok(work.dent));
             if !state.is_continue() {
                 return state;
             }
+        } else {
+            // Consume work.dent to avoid the borrow issue when we use
+            // work.ignore and work.deadline later.
+            drop(work.dent);
         }
         if !descend {
             return WalkState::Skip;
@@ -1701,11 +1844,37 @@ impl<'s> Worker<'s> {
         if self.max_depth.map_or(false, |max| depth >= max) {
             return WalkState::Skip;
         }
+
+        // Compute the deadline for child entries.
+        // If a deadline was already inherited (e.g. from a parent timeout),
+        // use the earlier of the inherited and the new one.
+        let child_deadline = if let Some(timeout) = self.dir_timeout {
+            let new_deadline = Instant::now() + timeout;
+            Some(match work.deadline {
+                Some(inherited) => std::cmp::min(inherited, new_deadline),
+                None => new_deadline,
+            })
+        } else {
+            work.deadline
+        };
+
         for result in readdir {
-            let state = self.generate_work(
+            // Check if we've exceeded the per-directory timeout.
+            if let Some(deadline) = child_deadline {
+                if Instant::now() > deadline {
+                    log::debug!(
+                        "dir-timeout expired in {} after {:?}, skipping remaining entries",
+                        dir_path.display(),
+                        deadline.elapsed()
+                    );
+                    break;
+                }
+            }
+            let state = self.generate_work_with_deadline(
                 &work.ignore,
                 depth + 1,
                 work.root_device,
+                child_deadline,
                 result,
             );
             if state.is_quit() {
@@ -1728,6 +1897,7 @@ impl<'s> Worker<'s> {
     /// `ig` is the `Ignore` matcher for the parent directory. `depth` should
     /// be the depth of this entry. `result` should be the item yielded by
     /// a directory iterator.
+    #[allow(dead_code)]
     fn generate_work(
         &mut self,
         ig: &Ignore,
@@ -1795,7 +1965,85 @@ impl<'s> Worker<'s> {
                 false
             };
         if !should_skip_filesize && !should_skip_filtered {
-            self.send(Work { dent, ignore: ig.clone(), root_device });
+            self.send(Work { dent, ignore: ig.clone(), root_device, deadline: None });
+        }
+        WalkState::Continue
+    }
+
+    /// Like `generate_work`, but also sets a deadline on child work items
+    /// for per-directory timeout support.
+    fn generate_work_with_deadline(
+        &mut self,
+        ig: &Ignore,
+        depth: usize,
+        root_device: Option<u64>,
+        deadline: Option<Instant>,
+        result: Result<fs::DirEntry, io::Error>,
+    ) -> WalkState {
+        let fs_dent = match result {
+            Ok(fs_dent) => fs_dent,
+            Err(err) => {
+                return self
+                    .visitor
+                    .visit(Err(Error::from(err).with_depth(depth)));
+            }
+        };
+        let mut dent = match DirEntryRaw::from_entry(depth, &fs_dent) {
+            Ok(dent) => DirEntry::new_raw(dent, None),
+            Err(err) => {
+                return self.visitor.visit(Err(err));
+            }
+        };
+        let is_symlink = dent.file_type().map_or(false, |ft| ft.is_symlink());
+        if self.follow_links && is_symlink {
+            let path = dent.path().to_path_buf();
+            dent = match DirEntryRaw::from_path(depth, path, true) {
+                Ok(dent) => DirEntry::new_raw(dent, None),
+                Err(err) => {
+                    return self.visitor.visit(Err(err));
+                }
+            };
+            if dent.is_dir() {
+                if let Err(err) = check_symlink_loop(ig, dent.path(), depth) {
+                    return self.visitor.visit(Err(err));
+                }
+            }
+        }
+        if should_skip_entry(ig, &dent) {
+            return WalkState::Continue;
+        }
+        if let Some(ref stdout) = self.skip {
+            let is_stdout = match path_equals(&dent, stdout) {
+                Ok(is_stdout) => is_stdout,
+                Err(err) => return self.visitor.visit(Err(err)),
+            };
+            if is_stdout {
+                return WalkState::Continue;
+            }
+        }
+        let should_skip_filesize =
+            if self.max_filesize.is_some() && !dent.is_dir() {
+                skip_filesize(
+                    self.max_filesize.unwrap(),
+                    dent.path(),
+                    &dent.metadata().ok(),
+                )
+            } else {
+                false
+            };
+        let should_skip_filtered =
+            if let Some(Filter(predicate)) = &self.filter {
+                !predicate(&dent)
+            } else {
+                false
+            };
+        if !should_skip_filesize && !should_skip_filtered {
+            self.send(Work {
+                dent,
+                ignore: ig.clone(),
+                root_device,
+                deadline,
+            });
         }
         WalkState::Continue
     }
